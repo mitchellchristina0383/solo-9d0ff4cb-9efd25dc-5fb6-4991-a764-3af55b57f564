@@ -34,6 +34,7 @@ async def _poll_loop() -> None:
         try:
             await service.poll_loading()
             await service.poll_releasing()
+            await service.finalize_sweep()
         except Exception as exc:  # 后台循环不能因单次异常退出
             print(f"[poll] {exc.__class__.__name__}: {exc}")
         await asyncio.sleep(config.POLL_INTERVAL)

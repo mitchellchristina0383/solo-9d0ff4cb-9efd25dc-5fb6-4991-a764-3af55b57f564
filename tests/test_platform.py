@@ -75,6 +75,7 @@ async def client():
             while True:
                 await service.poll_loading()
                 await service.poll_releasing()
+                await service.finalize_sweep()
                 await asyncio.sleep(0.2)
 
         async def health_loop():
@@ -353,3 +354,145 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
     r2 = await client.post("/api/deployments", json={
         "model_name": "new-tenant", "mem_per_replica_mb": 7000, "replica_count": 1})
     assert r2.status_code == 201, r2.text
+
+
+@pytest.mark.asyncio
+async def test_08_partial_failure_finalizes_whole_deployment(client):
+    # 值班场景：一台节点拒绝加载、另一台已加载成功。
+    # 修复目标：整次部署收尾——已加载副本被撤销并确认释放后，部署才标记失败可重试。
+    await client.post("/api/nodes/node-b/control", json={"load_fail": True})
+    r = await client.post("/api/deployments", json={
+        "model_name": "partial", "mem_per_replica_mb": 2048, "replica_count": 2})
+    assert r.status_code == 201, r.text
+    dep_id = r.json()["id"]
+
+    # B 立即 LOAD_FAILED -> 注定失败 -> 收尾撤销 A；全部确认不占用后 FAILED
+    dep = await wait_for(client, dep_id, {"FAILED"}, timeout=12)
+    reps = {x["node_id"]: x for x in dep["replicas"]}
+    assert reps["node-b"]["status"] == "LOAD_FAILED"   # 显式失败，不保留占用
+    assert reps["node-a"]["status"] == "RELEASED"      # 已加载副本被撤销并确认释放
+    # 显存账本：两台节点都不再有占用（修复前 A 的 2048MB 会永久泄漏）
+    book = (await client.get("/api/nodes")).json()
+    assert all(n["used_mb"] == 0 for n in book), book
+    # 节点 A 上旧加载确实被卸载
+    sim_a = client._transport._a.app.state  # type: ignore[attr-defined]
+    assert sim_a.replicas.get(reps["node-a"]["id"], {}).get("status") in (None, "unloaded")
+
+    # 清除故障后重试：开新 epoch，旧记录保留为终态不复活
+    await client.post("/api/nodes/node-b/control", json={"load_fail": False})
+    r2 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r2.status_code == 200, r2.text
+    dep2 = await wait_for(client, dep_id, {"AVAILABLE"})
+    assert dep2["epoch"] == 2 and dep2["attempts"] == 2
+    old = [x for x in dep2["replicas"] if x["epoch"] == 1]
+    new = [x for x in dep2["replicas"] if x["epoch"] == 2]
+    assert len(old) == 2 and len(new) == 2
+    assert all(x["status"] in {"LOAD_FAILED", "RELEASED"} for x in old)
+    assert all(x["status"] == "LOADED" for x in new)
+
+
+@pytest.mark.asyncio
+async def test_09_finalize_blocked_by_lost_node_until_release_confirmed(client):
+    # 收尾撤销时节点失联：保留占用并显示待核，重试与手动对账后重试均被拒；
+    # 节点恢复、对账确认释放后才标记可重试。
+    # 1) 正常部署双副本 -> AVAILABLE
+    r = await client.post("/api/deployments", json={
+        "model_name": "svc9", "mem_per_replica_mb": 2000, "replica_count": 2})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+
+    # 2) A 失联；B 被重置（节点重启丢状态）-> 对账发现 B 无残留 -> 部署注定失败
+    #    -> 触发整次收尾撤销 A，但 A 失联，撤销结果未知 -> 保留占用待核
+    await client.post("/api/nodes/node-a/control", json={"mode": "unreachable"})
+    await client.post("/api/nodes/node-b/reset")
+    await client.post(f"/api/deployments/{dep_id}/reconcile")
+
+    # 等待收尾推进到：B 已确认释放、A 释放中（失联卡住）
+    deadline = asyncio.get_event_loop().time() + 12
+    by_node = None
+    while asyncio.get_event_loop().time() < deadline:
+        dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+        by_node = {x["node_id"]: x for x in dep["replicas"]}
+        if (by_node["node-b"]["status"] in {"RELEASED", "LOAD_FAILED"}
+                and by_node["node-a"]["status"] == "RELEASING"):
+            break
+        await asyncio.sleep(0.2)
+    else:
+        raise AssertionError(f"失败收尾未如预期推进: {by_node}")
+    assert dep["status"] == "UNVERIFIED"  # 收尾期间显示待核，而非失败可重试
+
+    # A 上显存保留占用，不能被新部署挤占
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 2000
+    # 待核中重试被拒
+    r2 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r2.status_code == 409
+    # 手动对账（A 仍失联）：保持待核并说明原因，对账后重试仍被拒
+    rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+    assert rec["status"] == "UNVERIFIED"
+    assert any("失联" in n or "不可达" in n for n in rec["reconcile_notes"])
+    r3 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r3.status_code == 409
+
+    # 3) A 恢复：对账撤销节点上的旧加载并确认释放 -> FAILED -> 重试放行
+    await client.post("/api/nodes/node-a/control", json={"mode": "normal"})
+    await service.health_monitor_once()
+    dep = await wait_for(client, dep_id, {"FAILED"}, timeout=12)
+    assert all(x["status"] in {"RELEASED", "LOAD_FAILED"} for x in dep["replicas"])
+    book = (await client.get("/api/nodes")).json()
+    assert all(n["used_mb"] == 0 for n in book), book
+
+    r4 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r4.status_code == 200, r4.text
+    dep2 = await wait_for(client, dep_id, {"AVAILABLE"})
+    assert dep2["epoch"] == 2
+
+
+@pytest.mark.asyncio
+async def test_10_finalize_interleaved_with_late_load_ack(client):
+    # 失败收尾与在途加载回执交错：旧副本不得复活，收尾期间显存不超额占用。
+    # A 显式拒绝加载；B 加载回执慢（ack_delay）、卸载确认慢（unload_delay）
+    await client.post("/api/nodes/node-a/control", json={"load_fail": True})
+    await client.post("/api/nodes/node-b/control",
+                      json={"ack_delay": 0.8, "unload_delay": 1.0})
+    r = await client.post("/api/deployments", json={
+        "model_name": "race", "mem_per_replica_mb": 3000, "replica_count": 2})
+    assert r.status_code == 201, r.text
+    dep_id = r.json()["id"]
+
+    # A 立即 LOAD_FAILED -> 注定失败 -> 收尾撤销仍在加载中的 B
+    dep = await wait_for(client, dep_id, {"UNVERIFIED"}, timeout=8)
+    by_node = {x["node_id"]: x for x in dep["replicas"]}
+    assert by_node["node-a"]["status"] == "LOAD_FAILED"
+    assert by_node["node-b"]["status"] in {"LOADING", "RELEASING"}
+    rid_b = by_node["node-b"]["id"]
+
+    # 收尾期间 B 显存仍占用：大额新部署必须被拒（不超额），待核中重试也被拒
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-b") == 8192 - 3000
+    r2 = await client.post("/api/deployments", json={
+        "model_name": "squatter", "mem_per_replica_mb": 6000, "replica_count": 2})
+    assert r2.status_code == 409
+    r3 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r3.status_code == 409
+
+    # B 的迟到加载回执（ack_delay 0.8s）在收尾途中到达：不得复活旧副本；
+    # 节点确认卸载后副本 RELEASED，部署 FAILED
+    dep = await wait_for(client, dep_id, {"FAILED"}, timeout=12)
+    by_node = {x["node_id"]: x for x in dep["replicas"]}
+    assert by_node["node-b"]["status"] == "RELEASED"
+    sim_b = client._transport._b.app.state  # type: ignore[attr-defined]
+    assert sim_b.replicas.get(rid_b, {}).get("status") in (None, "unloaded")
+    book = (await client.get("/api/nodes")).json()
+    assert all(n["used_mb"] == 0 for n in book), book
+
+    # 重试开新 epoch 成功，旧记录保留为终态
+    await client.post("/api/nodes/node-a/control", json={"load_fail": False})
+    await client.post("/api/nodes/node-b/control",
+                      json={"ack_delay": 0.0, "unload_delay": 0.15})
+    r4 = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r4.status_code == 200, r4.text
+    dep2 = await wait_for(client, dep_id, {"AVAILABLE"})
+    assert dep2["epoch"] == 2
+    old = [x for x in dep2["replicas"] if x["epoch"] == 1]
+    assert all(x["status"] in {"LOAD_FAILED", "RELEASED"} for x in old)

@@ -205,8 +205,12 @@ def _set_replica(conn, rid: str, status: str, error: str | None = None,
     conn.execute(f"UPDATE replicas SET {','.join(sets)} WHERE id=?", params)
 
 
-def _evaluate(conn, dep_id: str) -> None:
-    """依据全部副本状态推导部署状态。"""
+def _evaluate(conn, dep_id: str) -> list[str]:
+    """依据当前 epoch 全部副本状态推导部署状态。
+
+    返回需要"失败收尾"撤销的副本 id 列表。本函数在写事务内运行，不能做网络 IO，
+    调用方必须在事务提交后再对返回的副本发起撤销（request_release 幂等）。
+    """
     dep = conn.execute("SELECT * FROM deployments WHERE id=?", (dep_id,)).fetchone()
     reps = conn.execute(
         "SELECT * FROM replicas WHERE deployment_id=? ORDER BY seq,epoch", (dep_id,)
@@ -219,6 +223,12 @@ def _evaluate(conn, dep_id: str) -> None:
     reason = dep["reason"]
     trouble = {models.REP_TIMEOUT, models.REP_UNVERIFIED, models.REP_RELEASING}
     terminal = {models.REP_RELEASED, models.REP_LOAD_FAILED}
+    # 仍占显存且可被主动撤销的副本（已加载/在途）
+    revocable = (models.REP_PENDING, models.REP_LOADING, models.REP_LOADED)
+    # 任一副本进入终态失败/已释放，本 epoch 即不可能全部可用：失败注定
+    doomed = bool(statuses & terminal)
+    finalize: list[str] = []
+
     if statuses & trouble:
         # 任何待核/释放中的副本都要保留占用，部署整体保持待核
         new_status = models.DEP_UNVERIFIED
@@ -226,23 +236,28 @@ def _evaluate(conn, dep_id: str) -> None:
                    for r in reps if r["status"] in trouble]
         reason = "存在待核副本，显存保留占用：" + "、".join(pending) + "。恢复后自动/手动对账"
     elif statuses and statuses <= terminal:
+        # 全部副本都已确认不占用显存，才允许标记失败可重试
         new_status = models.DEP_FAILED
         errs = [f"{r['node_id']}: {r['last_error'] or '未说明'}" for r in reps]
-        reason = "所有副本均未成功（可重试）。" + "；".join(errs)
+        reason = "部署失败，全部副本已确认不占用显存（可重试）。" + "；".join(errs)
     elif statuses and statuses == {models.REP_LOADED}:
         new_status = models.DEP_AVAILABLE
         reason = f"全部 {len(reps)} 个副本确认加载完成"
-    elif models.REP_LOADED in statuses and statuses <= {models.REP_LOADED, *terminal}:
-        # 部分副本确认加载、其余已终态失败/释放：本 epoch 无法满足全部副本，判定失败
-        new_status = models.DEP_FAILED
-        reason = ("部分副本未能加载，未满足全部副本可用的要求（可重试）："
-                  + "；".join(f"{r['node_id']}={models.REP_STATUS_CN[r['status']]}" for r in reps))
+    elif doomed:
+        # 部分副本终态失败，其余副本仍占显存：整次部署收尾——撤销其余已加载/
+        # 在途副本；节点确认释放前保持待核，不得提前标记可重试
+        new_status = models.DEP_UNVERIFIED
+        finalize = [r["id"] for r in reps if r["status"] in revocable]
+        holding = "、".join(
+            f"{r['node_id']}({models.REP_STATUS_CN[r['status']]})"
+            for r in reps if r["status"] in revocable
+        )
+        reason = ("部分副本失败，整次部署收尾中：撤销其余已加载/在途副本"
+                  f"（{holding}），节点确认释放后才标记可重试")
     else:
         # 仍有 PENDING/LOADING，且无待核/终态失败：继续调度
         new_status = models.DEP_PENDING
         reason = "加载进行中"
-        if statuses & terminal:
-            reason = "部分副本失败，等待其余副本结束后判定：" + reason
 
     if new_status != dep["status"] or reason != dep["reason"]:
         conn.execute(
@@ -250,9 +265,23 @@ def _evaluate(conn, dep_id: str) -> None:
             (new_status, reason, now(), dep_id),
         )
         log_event(conn, "DEP_" + new_status, reason, dep_id)
+    return finalize
 
 
 # ---------------------------------------------------------------- 加载编排
+async def _run_finalize(replica_ids: list[str]) -> None:
+    """事务外执行失败收尾：撤销仍占显存的已加载/在途副本。
+
+    request_release 幂等可重入；单个副本撤销异常不阻断其余副本，
+    遗漏由 finalize_sweep 兜底。
+    """
+    for rid in replica_ids:
+        try:
+            await request_release(rid, "部分副本失败，整次部署收尾：撤销已加载/在途副本")
+        except Exception as exc:
+            print(f"[finalize] 副本 {rid} 撤销异常: {exc.__class__.__name__}: {exc}")
+
+
 async def _load_replica(rid: str) -> None:
     rep = db.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
     if not rep or rep["status"] != models.REP_PENDING:
@@ -261,6 +290,11 @@ async def _load_replica(rid: str) -> None:
     node = config.NODE_MAP[rep["node_id"]]
 
     with db.tx() as conn:
+        # 事务内重查：副本可能已被失败收尾/对账流程处置（如置为 RELEASING），
+        # 此时不得再下发加载，避免旧副本复活
+        cur = conn.execute("SELECT status FROM replicas WHERE id=?", (rid,)).fetchone()
+        if not cur or cur["status"] != models.REP_PENDING:
+            return
         _set_replica(conn, rid, models.REP_LOADING)
         log_event(conn, "LOAD_SEND", f"向 {node.name} 下发加载 {dep['model_name']}（epoch={rep['epoch']}）",
                   dep["id"], rid, node.node_id)
@@ -269,6 +303,7 @@ async def _load_replica(rid: str) -> None:
         node.base_url, dep["model_name"], rid, rep["epoch"], rep["mem_mb"]
     )
 
+    finalize: list[str] = []
     with db.tx() as conn:
         cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rid,)).fetchone()
         if cur["status"] != models.REP_LOADING or cur["epoch"] != rep["epoch"]:
@@ -280,12 +315,14 @@ async def _load_replica(rid: str) -> None:
             _set_replica(conn, rid, models.REP_TIMEOUT, error=result.error)
             log_event(conn, "LOAD_TIMEOUT", result.error, dep["id"], rid, node.node_id)
             mark_node_lost(node.node_id, result.error)
-            _evaluate(conn, dep["id"])
+            finalize = _evaluate(conn, dep["id"])
         else:
             # 节点明确拒绝/HTTP 故障：确认未占用，释放本侧预留
             _set_replica(conn, rid, models.REP_LOAD_FAILED, error=result.error, released=True)
             log_event(conn, "LOAD_FAIL", result.error, dep["id"], rid, node.node_id)
-            _evaluate(conn, dep["id"])
+            finalize = _evaluate(conn, dep["id"])
+    if finalize:
+        await _run_finalize(finalize)
 
 
 async def poll_loading() -> None:
@@ -300,6 +337,7 @@ async def poll_loading() -> None:
                   datetime.fromisoformat(rep["updated_at"])).total_seconds()
         result = await node_client.query_replica(node.base_url, rep["id"], rep["epoch"])
 
+        finalize: list[str] = []
         with db.tx() as conn:
             cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rep["id"],)).fetchone()
             if cur["status"] != models.REP_LOADING or cur["epoch"] != rep["epoch"]:
@@ -313,33 +351,35 @@ async def poll_loading() -> None:
                     log_event(conn, "LOAD_TIMEOUT",
                               f"等待 {waited:.0f}s 仍无法确认，保留占用待核",
                               dep["id"], rep["id"], node.node_id)
-                    _evaluate(conn, dep["id"])
+                    finalize = _evaluate(conn, dep["id"])
                 # 未超时则继续等待，维持 LOADING 与预留
                 continue
             if remote == "loaded":
                 _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
                 log_event(conn, "LOAD_CONFIRMED", f"{node.name} 确认加载完成",
                           dep["id"], rep["id"], node.node_id)
-                _evaluate(conn, dep["id"])
+                finalize = _evaluate(conn, dep["id"])
             elif remote == "failed":
                 _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
                              error="节点上报加载失败", released=True)
                 log_event(conn, "LOAD_FAIL", "节点上报加载失败", dep["id"], rep["id"], node.node_id)
-                _evaluate(conn, dep["id"])
+                finalize = _evaluate(conn, dep["id"])
             elif remote == "unknown":
                 # 节点明确不存在该副本，远端不占显存，本侧预留可释放
                 _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
                              error="对账发现节点上无此副本（加载未生效）", released=True)
                 log_event(conn, "LOAD_MISSING", "节点上无此副本，释放预留",
                           dep["id"], rep["id"], node.node_id)
-                _evaluate(conn, dep["id"])
+                finalize = _evaluate(conn, dep["id"])
             else:  # loading / unloading：仍在途
                 if waited >= config.LOAD_TIMEOUT:
                     _set_replica(conn, rep["id"], models.REP_TIMEOUT,
                                  error=f"加载超过 {config.LOAD_TIMEOUT:.0f}s 未确认，保留占用待核")
                     log_event(conn, "LOAD_TIMEOUT", "节点在途过久，转待核",
                               dep["id"], rep["id"], node.node_id)
-                    _evaluate(conn, dep["id"])
+                    finalize = _evaluate(conn, dep["id"])
+        if finalize:
+            await _run_finalize(finalize)
 
 
 # ---------------------------------------------------------------- 释放/对账
@@ -356,6 +396,8 @@ async def request_release(rid: str, reason: str) -> None:
             _set_replica(conn, rid, models.REP_RELEASING, error=reason)
             log_event(conn, "RELEASE_SEND", f"请求 {node.name} 撤销旧加载：{reason}",
                       dep["id"], rid, node.node_id)
+            # _evaluate 的收尾返回值此处无需处理：本副本已转 RELEASING，
+            # 其余副本的收尾由各自状态变更点与 finalize_sweep 兜底
             _evaluate(conn, dep["id"])
 
     result = await node_client.unload(node.base_url, dep["model_name"], rid, rep["epoch"])
@@ -379,6 +421,7 @@ async def poll_releasing() -> None:
         node = config.NODE_MAP[rep["node_id"]]
         dep = db.query_one("SELECT * FROM deployments WHERE id=?", (rep["deployment_id"],))
         result = await node_client.query_replica(node.base_url, rep["id"], rep["epoch"])
+        finalize: list[str] = []
         with db.tx() as conn:
             cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rep["id"],)).fetchone()
             if cur["status"] != models.REP_RELEASING:
@@ -393,7 +436,7 @@ async def poll_releasing() -> None:
                              error="节点对账确认已释放", released=True)
                 log_event(conn, "RELEASE_CONFIRMED", "对账确认显存已释放，可重新分配",
                           dep["id"], rep["id"], node.node_id)
-                _evaluate(conn, dep["id"])
+                finalize = _evaluate(conn, dep["id"])
             else:
                 # loaded/loading/unloading：旧加载仍在，重新撤销
                 log_event(conn, "RELEASE_STILL_HELD",
@@ -401,6 +444,31 @@ async def poll_releasing() -> None:
                           dep["id"], rep["id"], node.node_id)
         if result.ok and (result.data or {}).get("status") not in ("unknown", "unloaded"):
             await node_client.unload(node.base_url, dep["model_name"], rep["id"], rep["epoch"])
+        if finalize:
+            await _run_finalize(finalize)
+
+
+async def finalize_sweep() -> None:
+    """兜底扫描：已注定失败（存在终态失败/已释放副本）但仍有副本占显存的部署，
+    补做失败收尾撤销。覆盖进程重启、异常中断等导致的收尾遗漏；
+    正常路径在各状态变更点由 _evaluate 即时触发。"""
+    deps = db.query(
+        "SELECT * FROM deployments WHERE status IN (?,?)",
+        (models.DEP_PENDING, models.DEP_UNVERIFIED),
+    )
+    terminal = {models.REP_RELEASED, models.REP_LOAD_FAILED}
+    revocable = (models.REP_PENDING, models.REP_LOADING, models.REP_LOADED)
+    for dep in deps:
+        reps = db.query(
+            "SELECT * FROM replicas WHERE deployment_id=? AND epoch=?",
+            (dep["id"], dep["epoch"]),
+        )
+        if not ({r["status"] for r in reps} & terminal):
+            continue
+        for r in reps:
+            if r["status"] in revocable:
+                await request_release(
+                    r["id"], "部分副本失败，整次部署收尾：撤销已加载/在途副本")
 
 
 async def reconcile(dep_id: str) -> dict:
@@ -413,6 +481,7 @@ async def reconcile(dep_id: str) -> dict:
         (dep_id, dep["epoch"]),
     )
     notes: list[str] = []
+    finalize_ids: set[str] = set()
     for rep in reps:
         # 仅终态副本跳过：已确认释放/明确失败的无需再核实
         if rep["status"] in (models.REP_RELEASED, models.REP_LOAD_FAILED):
@@ -474,8 +543,13 @@ async def reconcile(dep_id: str) -> dict:
                     notes.append(f"{node.name} 上副本仍在 {remote}，维持待核继续观察")
                 else:
                     notes.append(f"{node.name} 上副本处于 {remote}，维持 {models.REP_STATUS_CN[st]}")
-            _evaluate(conn, dep_id)
+            finalize_ids.update(_evaluate(conn, dep_id))
 
+    # 失败收尾：部署已注定失败时，撤销仍占显存的已加载/在途副本
+    if finalize_ids:
+        notes.append(f"部分副本已失败，整次部署收尾：撤销 {len(finalize_ids)} 个仍占显存的副本")
+    for rid in sorted(finalize_ids):
+        await request_release(rid, "部分副本失败，整次部署收尾：撤销已加载/在途副本")
     # 对账中新出现的待核/不一致副本，自动发起撤销
     for rep in db.query(
         "SELECT * FROM replicas WHERE deployment_id=? AND epoch=? AND status IN (?,?)",
